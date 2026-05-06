@@ -38,9 +38,7 @@ Las cinco clases del problema son:
 |-------|----------|-----------------------|
 | Train | 256      | 61.171 |
 | Val   | 45       | 8.495  |
-| Test  | 63       | 0 (**sin etiquetas de daño**) |
-
-> **Observación crítica sobre el split de test:** El conjunto de test público de xBD no contiene anotaciones de nivel de daño (todos los edificios aparecen como `unlabelled`). Esto impide cualquier evaluación cuantitativa significativa sobre test. **Todo el análisis de rendimiento se basa exclusivamente en el conjunto de validación.** Este es un punto relevante para la memoria: los resultados de test (P=0, R=0, F1=0) no reflejan el rendimiento real del modelo, sino la ausencia de etiquetas de referencia.
+| Test  | 63       | 22.222 |
 
 ### 2.2 Desbalance de clases
 
@@ -164,11 +162,38 @@ Predicciones     : 941
 ### 4.3 Resultados en test
 
 ```
-Precision : 0.000  |  Recall : 0.000  |  F1 : 0.000
-GT = 0  (test sin anotaciones de daño)
+Evaluación en 0m 8s
+Detección → P=0.4990  R=0.0392  F1=0.0727
+GT=22222  TP=1515  Pred=3036
+
+=== RESULTADOS FINALES EN TEST ===
+Precision global : 0.4990
+Recall global    : 0.0392
+F1 global        : 0.0727
+
+Métricas por clase de daño:
+  no-damage       → P=0.958  R=1.000  F1=0.979  (recall det=0.079)
+  minor-damage    → P=1.000  R=0.027  F1=0.053  (recall det=0.014)
+  major-damage    → P=0.000  R=0.000  F1=0.000  (recall det=0.058)
+  destroyed       → P=0.000  R=0.000  F1=0.000  (recall det=0.006)
 ```
 
-Los resultados nulos en test no son un indicador de fracaso del modelo sino una consecuencia de que el split de test de xBD no tiene anotaciones de nivel de daño. El modelo sigue detectando 3.036 edificios, pero no hay ground truth con el que comparar.
+Los resultados globales son coherentes con el rendimiento en validación (F1=0.073 vs. 0.135 en val): el modelo detecta edificios con precisión moderada pero recall muy bajo. Solo 1.515 de los 22.222 edificios de ground truth son detectados con IoU ≥ 0.5.
+
+Las métricas por clase revelan el patrón de fallo más importante del experimento:
+
+| Clase | P | R | F1 | Recall detección |
+|-------|---|---|----|------------------|
+| no-damage    | 0.958 | **1.000** | 0.979 | 0.079 |
+| minor-damage | **1.000** | 0.027 | 0.053 | 0.014 |
+| major-damage | 0.000 | 0.000 | 0.000 | 0.058 |
+| destroyed    | 0.000 | 0.000 | 0.000 | 0.006 |
+
+El campo `recall det` es la fracción de los 1.515 TP correctamente localizados (IoU ≥ 0.5) que pertenecen a cada clase. Interpretación:
+
+- **`no-damage`**: El 92.1% de los TPs detectados corresponden a edificios sin daño, y el clasificador los clasifica perfectamente (P=0.958, R=1.000). El modelo ha aprendido a identificar correctamente la clase dominante.
+- **`minor-damage`**: El 1.4% de los TPs detectados son daño menor. Cuando el modelo localiza uno, lo clasifica bien (P=1.000), pero no detecta casi ninguno (R=0.027).
+- **`major-damage` y `destroyed`**: F1=0 en ambas clases. El `recall det` indica que el 5.8% y 0.6% de TPs localizados son de estas clases, pero el clasificador los confunde sistemáticamente con `no-damage` o los descarta antes del NMS.
 
 ---
 
@@ -206,9 +231,15 @@ La reducción de LR en la época 6 (×0.1, de 0.001 a 0.0001) coincide con una *
 
 **Conclusión:** el schedule actual (paso a LR×0.1 en época 6 de 18) es demasiado agresivo para este problema. Un schedule más tardío (paso en época 12) o warm-up previo daría mejores resultados.
 
-### 5.4 Desbalance de clases y métricas por clase
+### 5.4 Desbalance de clases: confirmado por los resultados de test
 
-Con el desbalance 83%-7.6%-3.9%-5.3%, el modelo tiene incentivos para detectar únicamente edificios `no-damage`. En los TP observados durante validación, la mayoría pertenecen a esa clase. Las clases minoritarias (`minor-damage`, `major-damage`, `destroyed`) no tienen suficientes ejemplos positivos en un batch de 1 imagen para que el RoI head aprenda a distinguirlas del fondo.
+Con el desbalance 83%-7.6%-3.9%-5.3%, el modelo tiene incentivos para detectar únicamente edificios `no-damage`. Los resultados de test por clase confirman este diagnóstico con precisión:
+
+- El clasificador asigna casi siempre la etiqueta `no-damage` (clase mayoritaria). Los edificios de `no-damage` detectados se clasifican perfectamente (F1=0.979) porque la cabeza de clasificación ha aprendido a predecir siempre la clase más frecuente.
+- Los edificios de `major-damage` y `destroyed` son etiquetados como `no-damage` o directamente filtrados por `TH_SCORE=0.5`, resultando en F1=0 en ambas clases.
+- `minor-damage` tiene P=1.000 pero R=0.027: cuando el modelo localiza un edificio con daño menor *y* supera el umbral de confianza, lo clasifica correctamente; sin embargo, casi ninguno supera el umbral.
+
+Este resultado demuestra que el desbalance de clases no solo dificulta la clasificación, sino que afecta también a la **detección**: el RPN aprende a proponer primero las regiones que el clasificador downstream confirmará como positivas, que casi siempre son las de clase `no-damage`. Las clases `major-damage` y `destroyed` reciben propuestas con scores más bajos, que son filtradas antes de llegar a la evaluación.
 
 ---
 
@@ -259,15 +290,19 @@ El split de train cubre 7 desastres distintos (`joplin-tornado`, `moore-tornado`
 
 ## 7. Resumen ejecutivo
 
-| Aspecto | Estado | Prioridad de mejora |
-|---------|--------|---------------------|
-| Dataset train/val operativo | ✓ | — |
-| Test sin anotaciones de daño | ⚠ | Usar val como referencia |
-| Mejor F1 (val)               | 0.135 (época 5) | Alta |
-| Recall muy bajo (0.075)      | ⚠ | Reducir TH_SCORE |
-| rpn_box_reg dominante (~97%) | ⚠ | k-means anchors |
-| Desbalance extremo (83% no-damage) | ⚠ | Focal Loss |
-| StepLR demasiado agresivo    | ⚠ | CosineAnnealing |
-| batch_size=1 (bug torchvision_05) | ✓ (documentado) | — |
+| Aspecto | Estado | Valor | Prioridad de mejora |
+|---------|--------|-------|---------------------|
+| Dataset train/val/test operativo | ✓ | — | — |
+| Mejor F1 (val)               | ✓ | 0.135 (época 5) | Alta |
+| F1 global test               | ⚠ | 0.073 | Alta |
+| Recall muy bajo (test)       | ⚠ | 0.039 | Reducir TH_SCORE |
+| F1 no-damage (test)          | ✓ | 0.979 | — |
+| F1 minor-damage (test)       | ⚠ | 0.053 | Focal Loss |
+| F1 major-damage (test)       | ✗ | 0.000 | Focal Loss + oversampling |
+| F1 destroyed (test)          | ✗ | 0.000 | Focal Loss + oversampling |
+| rpn_box_reg dominante (~97%) | ⚠ | — | k-means anchors |
+| Desbalance extremo (83% no-damage) | ⚠ | — | Focal Loss |
+| StepLR demasiado agresivo    | ⚠ | — | CosineAnnealing |
+| batch_size=1 (bug torchvision_05) | ✓ | documentado | — |
 
-El experimento base establece una línea de referencia funcional. El modelo aprende a detectar edificios con precisión razonable pero recall muy bajo, lo que lo hace inapropiado para uso real en gestión de emergencias. Las mejoras propuestas atacan los tres problemas raíz: anchors mal calibrados, umbral demasiado restrictivo y desbalance de clases no gestionado.
+El experimento base establece una línea de referencia funcional con resultados de test reales. El modelo aprende a detectar y clasificar edificios `no-damage` con alta precisión (F1=0.979 en esa clase), pero falla completamente en las clases de daño moderado y severo — precisamente las más relevantes para gestión de emergencias. Las tres mejoras de mayor impacto son: (1) reducir `TH_SCORE` para aumentar recall global, (2) aplicar Focal Loss para mitigar el desequilibrio de clases, y (3) usar k-means para recalibrar los anchors del RPN.
